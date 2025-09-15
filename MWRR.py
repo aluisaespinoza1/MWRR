@@ -2,10 +2,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import pyxirr
+import dateutil.parser as dp
 
-def parse_spanish_date(date_str):
+def parse_date_safe(date_str):
     """
-    Convierte fechas en español a datetime
+    Función auxiliar para parsear fechas en español usando el mismo patrón que dp.parse
     """
     if pd.isna(date_str):
         return pd.NaT
@@ -23,16 +24,18 @@ def parse_spanish_date(date_str):
         
         date_str = str(date_str).strip()
         
+        # Si es formato numérico, usar dateutil directamente
         if '/' in date_str or '-' in date_str:
-            return pd.to_datetime(date_str, dayfirst=True, errors='coerce')
+            return dp.parse(date_str, dayfirst=True)
         
+        # Si contiene texto en español, traducir
         date_lower = date_str.lower()
         for esp, eng in spanish_months.items():
             if esp in date_lower:
                 date_str = date_str.replace(esp, eng).replace(' de ', ' ')
                 break
         
-        return pd.to_datetime(date_str, errors='coerce')
+        return dp.parse(date_str)
         
     except:
         return pd.NaT
@@ -54,85 +57,75 @@ except FileNotFoundError:
 except Exception as e:
     print(f"Error cargando el archivo: {e}")
 
-def clean_balance_data(df_balance):
-    """
-    Limpia y procesa los datos de balance para obtener el valor del portafolio por fecha y contrato
-    """
-    df_clean = df_balance.copy()
+def clean_balance_data(data):
+    cols = ['contract', 'value_pos_mdo', 'balance_date']
+    df = data[cols]
     
-    # Convertir fechas
-    df_clean['balance_date'] = df_clean['balance_date'].apply(parse_spanish_date)
+    df['balance_date_2'] = df["balance_date"].apply(lambda x: parse_date_safe(x))
     
-    # Eliminar filas con fechas inválidas
-    df_clean = df_clean.dropna(subset=['balance_date'])
+    clean_balance_data = (df.groupby(["contract", "balance_date_2"], as_index=False)["value_pos_mdo"]
+                         .sum())
     
-    # Agrupar por contrato y fecha, sumando value_pos_mdo
-    df_grouped = df_clean.groupby(['contract', 'balance_date'])['value_pos_mdo'].sum().reset_index()
-    
-    # Renombrar columnas
-    df_grouped.rename(columns={
-        'balance_date': 'Date',
-        'value_pos_mdo': 'Portfolio_Value',
-        'contract': 'Contract'
-    }, inplace=True)
-    
-    # Ordenar por contrato y fecha
-    df_grouped = df_grouped.sort_values(['Contract', 'Date']).reset_index(drop=True)
-    
-    return df_grouped
+    return clean_balance_data
 
-def clean_movements_data(df_movements):
-    """
-    Limpia y filtra los datos de movimientos para obtener solo depósitos y retiros
-    """
-    df_clean = df_movements.copy()
+def clean_movements_data(data):
+    # Definir patrones para flujos de efectivo
+    depositos_patterns = [
+        'DEPOSITO DE EFECTIVO',
+        'DEPOSITO DE EFECTIVO POR TRANSFERENCIA', 
+        'Compra en Reporto',
+        'Compra Soc. de Inv.- Cliente'
+    ]
     
-    # Filtrar depósitos y retiros
-    deposits_withdrawals = df_clean[
-        df_clean['description'].str.contains('Depósito|Retiro', case=False, na=False)
-    ].copy()
+    retiros_patterns = [
+        'RETIRO DE EFECTIVO',
+        'Venta Normal',
+        'Venta Soc. de Inv.- Cliente',
+        'Vencimiento de Reporto',
+        'Amortización (cliente)',
+        'Amortizacion (cliente)'
+    ]
     
-    if len(deposits_withdrawals) == 0:
-        return pd.DataFrame(columns=['Contract', 'Description', 'Movement_Import', 'Operation_Date'])
+    all_patterns = depositos_patterns + retiros_patterns
+    pattern = '|'.join(all_patterns)
     
-    # Convertir fechas
-    deposits_withdrawals['operation_date'] = deposits_withdrawals['operation_date'].apply(parse_spanish_date)
+    # Filtrar movimientos de efectivo
+    cash_flows = data[data['description'].str.contains(pattern, case=False, na=False, regex=True)]
     
-    # Eliminar filas con fechas inválidas
-    deposits_withdrawals = deposits_withdrawals.dropna(subset=['operation_date'])
+    cols = ['contract', 'description', 'movement_import', 'operation_date']
+    df = cash_flows[cols]
     
-    # Seleccionar columnas necesarias
-    df_filtered = deposits_withdrawals[['contract', 'description', 'movement_import', 'operation_date']].copy()
+    df['operation_date_2'] = df["operation_date"].apply(lambda x: parse_date_safe(x))
     
-    # Renombrar columnas
-    df_filtered.rename(columns={
-        'contract': 'Contract',
-        'description': 'Description',
-        'movement_import': 'Movement_Import',
-        'operation_date': 'Operation_Date'
-    }, inplace=True)
+    # Clasificar tipo de flujo
+    def classify_flow(description):
+        desc_lower = description.lower()
+        for pattern in depositos_patterns:
+            if pattern.lower() in desc_lower:
+                return 'Deposito'
+        for pattern in retiros_patterns:
+            if pattern.lower().replace('\\\\', '') in desc_lower:
+                return 'Retiro'
+        return 'Otro'
     
-    # Ordenar por contrato y fecha
-    df_filtered = df_filtered.sort_values(['Contract', 'Operation_Date']).reset_index(drop=True)
+    df['flow_type'] = df['description'].apply(classify_flow)
     
-    return df_filtered
+    clean_movements_data = df.sort_values(['contract', 'operation_date_2']).reset_index(drop=True)
+    
+    return clean_movements_data
 
 def MWRR(balance_data, movements_data, contract):
     """
     Calcula el Money Weighted Return Rate (MWRR) para un contrato específico
     
-    Parameters:
-    - balance_data: DataFrame con datos de balance limpio
-    - movements_data: DataFrame con datos de movimientos limpio
-    - contract: string con el número de contrato
-    
-    Returns:
-    - float: MWRR anualizado
+    Flujos de efectivo:
+    - Positivos: Valor inicial, depósitos (dinero que entra al portafolio)
+    - Negativos: Valor final, retiros (dinero que sale del portafolio)
     """
     
     # Filtrar datos por contrato
-    balance_contract = balance_data[balance_data['Contract'] == contract].copy()
-    movements_contract = movements_data[movements_data['Contract'] == contract].copy()
+    balance_contract = balance_data[balance_data['contract'] == contract]
+    movements_contract = movements_data[movements_data['contract'] == contract]
     
     if balance_contract.empty:
         print(f"No hay datos de balance para el contrato {contract}")
@@ -142,38 +135,42 @@ def MWRR(balance_data, movements_data, contract):
     cash_flow_dates = []
     cash_flows = []
     
-    # Agregar movimientos
-    for _, row in movements_contract.iterrows():
-        cash_flow_dates.append(row['Operation_Date'])
-        
-        if 'Depósito' in row['Description']:
-            cash_flows.append(row['Movement_Import'])
-        else:  # Retiro
-            cash_flows.append(-row['Movement_Import'])
-    
-    # Agregar valor inicial del portafolio
+    # Agregar valor inicial del portafolio como flujo positivo
     if not balance_contract.empty:
-        first_date = balance_contract['Date'].min()
-        first_value = balance_contract[balance_contract['Date'] == first_date]['Portfolio_Value'].iloc[0]
+        first_date = balance_contract['balance_date_2'].min()
+        first_value = balance_contract[balance_contract['balance_date_2'] == first_date]['value_pos_mdo'].iloc[0]
         
-        if first_date not in cash_flow_dates:
-            cash_flow_dates.append(first_date)
-            cash_flows.append(-first_value)
+        cash_flow_dates.append(first_date)
+        cash_flows.append(first_value)
     
-    # Agregar valor final del portafolio
-    last_date = balance_contract['Date'].max()
-    last_value = balance_contract[balance_contract['Date'] == last_date]['Portfolio_Value'].iloc[0]
+    # Agregar movimientos de efectivo
+    for _, row in movements_contract.iterrows():
+        cash_flow_dates.append(row['operation_date_2'])
+        
+        if row['flow_type'] == 'Deposito':
+            cash_flows.append(row['movement_import'])
+        elif row['flow_type'] == 'Retiro':
+            cash_flows.append(-row['movement_import'])
+    
+    # Agregar valor final del portafolio como flujo negativo
+    last_date = balance_contract['balance_date_2'].max()
+    last_value = balance_contract[balance_contract['balance_date_2'] == last_date]['value_pos_mdo'].iloc[0]
     
     cash_flow_dates.append(last_date)
-    cash_flows.append(last_value)
+    cash_flows.append(-last_value)
     
     # Verificar datos suficientes
     if len(cash_flows) < 2:
         print(f"Datos insuficientes para calcular MWRR del contrato {contract}")
         return None
     
+    # Mostrar información de debug
+    print(f"\nContrato {contract} - Flujos de efectivo:")
+    for i, (date, flow) in enumerate(zip(cash_flow_dates, cash_flows)):
+        flow_type = "Entrada" if flow > 0 else "Salida"
+        print(f"  {date.strftime('%Y-%m-%d')}: ${flow:,.2f} ({flow_type})")
+    
     try:
-        # Calcular MWRR usando pyxirr
         mwrr = pyxirr.xirr(cash_flow_dates, cash_flows)
         return mwrr
     except Exception as e:
@@ -195,7 +192,7 @@ def process_portfolio_analysis():
     print(f"Movimientos procesados: {len(clean_movements)} filas")
     
     # Obtener contratos únicos
-    contratos = clean_balance['Contract'].unique()
+    contratos = clean_balance['contract'].unique()
     print(f"Contratos encontrados: {list(contratos)}")
     
     # Calcular MWRR para cada contrato
@@ -223,4 +220,20 @@ if __name__ == "__main__":
         # Procesar y calcular rendimientos
         results, balance_data, movements_data = process_portfolio_analysis()
         
+        # Mostrar resumen final
+        print("RESUMEN FINAL - RENDIMIENTOS MWRR")
     
+        total_contratos = len(results)
+        exitosos = sum(1 for v in results.values() if v is not None)
+        
+        for contract, mwrr in results.items():
+            if mwrr is not None:
+                print(f"Contrato {contract}: {mwrr*100:.4f}% anual")
+            else:
+                print(f"Contrato {contract}: No se pudo calcular")
+        
+        print(f"\nProcesados: {exitosos}/{total_contratos} contratos")
+        print("Análisis completado")
+                
+    else:
+        print("Error: No se pudieron cargar los datos del archivo Excel.")
