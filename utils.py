@@ -23,10 +23,10 @@ def clean_balance_data(data):
         contract_dfs[contract] = grouped.reset_index(drop=True)
 
         # Create a global variable for each contract
-        globals()[f"df_{contract}"] = contract_dfs[contract]
+        globals()[f"balance_{contract}"] = contract_dfs[contract]
 
     # Collect names of created variables
-    created_vars = [f"df_{contract}" for contract in contract_dfs.keys()]
+    created_vars = [f"balance_{contract}" for contract in contract_dfs.keys()]
 
     return contract_dfs, created_vars
 
